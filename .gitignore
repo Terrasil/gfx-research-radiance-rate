@@ -1,0 +1,10 @@
+build/
+cmake-build-*/
+thirdparty/
+.cpm-cache/
+results/
+.idea/
+.vscode/
+*.user
+*.suo
+*.log

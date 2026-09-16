@@ -1,0 +1,204 @@
+#version 460 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D uAlbedoRoughness;
+layout(binding = 1) uniform sampler2D uNormalValid;
+layout(binding = 2) uniform sampler2D uPositionValid;
+
+layout(rgba16f, binding = 0) uniform writeonly image2D uOutput;
+layout(r16f, binding = 1) uniform writeonly image2D uRateOutput;
+
+uniform vec3 uEye;
+uniform int uMode; // 0 full, 1 fixed 2x2, 2 fixed 4x4, 3 heuristic, 4 proposed radiance-error estimator
+uniform int uLightCount;
+uniform float uErrorBudget;
+uniform uint uFrameSeed;
+
+const float PI = 3.14159265358979323846;
+
+shared vec4 sA[64];
+shared vec4 sN[64];
+shared vec4 sP[64];
+shared vec4 sRadiance[64];
+shared int sRate;
+shared float sPredictedError;
+
+vec3 decodeNormal(vec4 v) {
+    return normalize(v.xyz * 2.0 - 1.0);
+}
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void lightData(int i, out vec3 position, out vec3 color, out float intensity) {
+    float fi = float(i);
+    float ring = 2.4 + 0.65 * float(i % 5);
+    float a = fi * 2.39996323 + 0.37;
+    position = vec3(cos(a) * ring, 0.8 + 0.34 * float(i % 7), sin(a) * ring);
+    color = 0.65 + 0.35 * cos(vec3(0.0, 2.1, 4.2) + fi * 0.73);
+    intensity = 5.0 + 1.5 * float(i % 4);
+}
+
+float D_GGX(float NoH, float a) {
+    float a2 = a * a;
+    float d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-5);
+}
+
+float G1(float NoV, float a) {
+    float a2 = a * a;
+    return 2.0 * NoV / max(NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV), 1e-5);
+}
+
+vec3 F_Schlick(float VoH, vec3 f0) {
+    float f = pow(1.0 - VoH, 5.0);
+    return f0 + (1.0 - f0) * f;
+}
+
+vec3 shadeOne(vec3 albedo, float roughness, vec3 n, vec3 p, vec3 lightP, vec3 lightC, float intensity) {
+    vec3 V = normalize(uEye - p);
+    vec3 toL = lightP - p;
+    float d2 = max(dot(toL, toL), 0.04);
+    vec3 L = toL * inversesqrt(d2);
+    vec3 H = normalize(V + L);
+    float NoV = max(dot(n, V), 1e-4);
+    float NoL = max(dot(n, L), 0.0);
+    if (NoL <= 0.0) return vec3(0.0);
+    float NoH = max(dot(n, H), 0.0);
+    float VoH = max(dot(V, H), 0.0);
+    float a = max(roughness * roughness, 0.0025);
+    vec3 f0 = vec3(0.04);
+    vec3 spec = D_GGX(NoH, a) * G1(NoV, a) * G1(NoL, a) * F_Schlick(VoH, f0)
+        / max(4.0 * NoV * NoL, 1e-4);
+    vec3 diff = albedo / PI;
+    float attenuation = intensity / d2;
+    return (diff + spec) * lightC * attenuation * NoL;
+}
+
+vec3 shade(vec4 ar, vec4 nv, vec4 pv) {
+    if (pv.a < 0.5 || nv.a < 0.5) return vec3(0.012, 0.016, 0.024);
+    vec3 albedo = ar.rgb;
+    float roughness = clamp(ar.a, 0.04, 1.0);
+    vec3 n = decodeNormal(nv);
+    vec3 p = pv.xyz;
+    vec3 result = albedo * 0.018;
+    for (int i = 0; i < uLightCount; ++i) {
+        vec3 lp, lc;
+        float intensity;
+        lightData(i, lp, lc, intensity);
+        result += shadeOne(albedo, roughness, n, p, lp, lc, intensity);
+    }
+    return result;
+}
+
+float representativeErrorBound(
+    vec4 centerA,
+    vec4 centerN,
+    vec4 centerP,
+    vec4 extremeA,
+    vec4 extremeN,
+    vec4 extremeP,
+    float extremeRoughness
+) {
+    vec3 lp, lc;
+    float intensity;
+    lightData(0, lp, lc, intensity);
+    vec3 n0 = decodeNormal(centerN);
+    vec3 ne = decodeNormal(extremeN);
+    vec3 base = shadeOne(centerA.rgb, centerA.a, n0, centerP.xyz, lp, lc, intensity);
+    float eA = abs(luminance(shadeOne(extremeA.rgb, centerA.a, n0, centerP.xyz, lp, lc, intensity)) - luminance(base));
+    float eN = abs(luminance(shadeOne(centerA.rgb, centerA.a, ne, centerP.xyz, lp, lc, intensity)) - luminance(base));
+    float eP = abs(luminance(shadeOne(centerA.rgb, centerA.a, n0, extremeP.xyz, lp, lc, intensity)) - luminance(base));
+    float eR = abs(luminance(shadeOne(centerA.rgb, extremeRoughness, n0, centerP.xyz, lp, lc, intensity)) - luminance(base));
+    float lightScale = sqrt(max(float(uLightCount), 1.0) / 16.0);
+    return (eA + eN + eP + eR) * max(lightScale, 0.5);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    int idx = local.y * 8 + local.x;
+    ivec2 resolution = imageSize(uOutput);
+    bool inside = all(lessThan(pixel, resolution));
+
+    vec4 ar = inside ? texelFetch(uAlbedoRoughness, pixel, 0) : vec4(0.0);
+    vec4 nv = inside ? texelFetch(uNormalValid, pixel, 0) : vec4(0.0);
+    vec4 pv = inside ? texelFetch(uPositionValid, pixel, 0) : vec4(0.0);
+    sA[idx] = ar;
+    sN[idx] = nv;
+    sP[idx] = pv;
+    barrier();
+
+    if (idx == 0) {
+        sRate = 1;
+        sPredictedError = 0.0;
+        if (uMode == 1) {
+            sRate = 2;
+        } else if (uMode == 2) {
+            sRate = 4;
+        } else if (uMode != 0) {
+            int validCount = 0;
+            int firstValid = -1;
+            float maxAlbedo = 0.0;
+            float maxRough = 0.0;
+            float maxNormal = 0.0;
+            float maxPosition = 0.0;
+            int ia = 0, ir = 0, inorm = 0, ip = 0;
+            for (int i = 0; i < 64; ++i) {
+                if (sP[i].a < 0.5 || sN[i].a < 0.5) continue;
+                if (firstValid < 0) firstValid = i;
+                ++validCount;
+            }
+            if (validCount == 64 && firstValid >= 0) {
+                vec4 ca = sA[firstValid];
+                vec4 cn = sN[firstValid];
+                vec4 cp = sP[firstValid];
+                vec3 n0 = decodeNormal(cn);
+                for (int i = 0; i < 64; ++i) {
+                    float da = length(sA[i].rgb - ca.rgb);
+                    float dr = abs(sA[i].a - ca.a);
+                    float dn = 1.0 - clamp(dot(decodeNormal(sN[i]), n0), -1.0, 1.0);
+                    float dp = length(sP[i].xyz - cp.xyz);
+                    if (da > maxAlbedo) { maxAlbedo = da; ia = i; }
+                    if (dr > maxRough) { maxRough = dr; ir = i; }
+                    if (dn > maxNormal) { maxNormal = dn; inorm = i; }
+                    if (dp > maxPosition) { maxPosition = dp; ip = i; }
+                }
+
+                if (uMode == 3) {
+                    // Conventional screen-space heuristic baseline.
+                    if (maxNormal < 0.015 && maxPosition < 0.22 && maxAlbedo < 0.08 && maxRough < 0.08) sRate = 4;
+                    else if (maxNormal < 0.05 && maxPosition < 0.55 && maxAlbedo < 0.18 && maxRough < 0.18) sRate = 2;
+                } else {
+                    vec4 extremeA = sA[ia];
+                    vec4 extremeN = sN[inorm];
+                    vec4 extremeP = sP[ip];
+                    float extremeR = sA[ir].a;
+                    sPredictedError = representativeErrorBound(ca, cn, cp, extremeA, extremeN, extremeP, extremeR);
+                    float e4 = sPredictedError;
+                    float e2 = sPredictedError * 0.42;
+                    if (e4 <= uErrorBudget) sRate = 4;
+                    else if (e2 <= uErrorBudget) sRate = 2;
+                }
+            }
+        }
+    }
+    barrier();
+
+    int rate = sRate;
+    bool sampleInvocation = (local.x % rate == 0) && (local.y % rate == 0);
+    if (sampleInvocation) {
+        sRadiance[idx] = vec4(shade(ar, nv, pv), 1.0);
+    }
+    barrier();
+
+    if (!inside) return;
+    int sx = (local.x / rate) * rate;
+    int sy = (local.y / rate) * rate;
+    int sampleIndex = sy * 8 + sx;
+    vec4 color = sRadiance[sampleIndex];
+    imageStore(uOutput, pixel, color);
+    imageStore(uRateOutput, pixel, vec4(float(rate), 0.0, 0.0, 1.0));
+}
