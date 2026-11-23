@@ -1,71 +1,63 @@
 # gfx-research-radiance-rate
 
-Research harness for **deferred shading-rate selection driven by a predicted GGX radiance-error budget**.
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](https://en.cppreference.com/w/cpp/20)
+[![OpenGL 4.6](https://img.shields.io/badge/OpenGL-4.6-5586A4.svg)](https://www.opengl.org/)
+[![CMake](https://img.shields.io/badge/CMake-3.25%2B-064F8C.svg)](https://cmake.org/)
 
-The project renders a textured Sponza G-buffer once and compares:
+A deferred GGX lighting experiment for selecting compute-shader shading rates within 8 × 8 pixel tiles.
 
-1. full-rate deferred PBR shading,
-2. fixed 2x2 and fixed 4x4 shading baselines,
-3. a conventional screen-space variation heuristic,
-4. a proposed tile-local radiance-error estimator that selects 1x1, 2x2 or 4x4 shading blocks.
-
-The method works entirely after rasterization. It does not alter geometry density and does not require a reference image at runtime.
-
-## Build
-
-```powershell
-cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-release
-```
-
-With a local base checkout:
-
-```powershell
-cmake -S . -B cmake-build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  -DGFX_RESEARCH_BASE_LOCAL_PATH=E:/gfx-research-base
-```
-
-## Run
-
-```powershell
-.\cmake-build-release\gfx-research-radiance-rate.exe
-```
-
-The GUI exposes the method, light count, radiance budget, roughness scaling and a shading-rate visualization.
-
-## Publication suites
-
-Quick:
-
-```powershell
-.\cmake-build-release\gfx-research-radiance-rate.exe `
-  --publication-quick --output=results/quick
-python tools/analyze_results.py results/quick
-```
-
-Full:
-
-```powershell
-.\cmake-build-release\gfx-research-radiance-rate.exe `
-  --publication-suite --output=results/publication
-python tools/analyze_results.py results/publication
-```
-
-The full suite varies exact offscreen resolution, point-light count, camera preset, roughness scaling and the error budget.
+[Method](#method) · [Build](#build) · [Controls](#controls) · [Experiments](#experiments) · [References](#references)
 
 ## Method
 
-Each 8x8 compute workgroup first loads G-buffer albedo/roughness, normal and world position into shared memory. Mixed-validity tiles are forced to full rate. For homogeneous tiles, the proposed path measures within-tile attribute excursions and evaluates a small GGX proxy at a representative light to obtain a predicted radiance-error signal. The tile then chooses 1x1, 2x2 or 4x4 shading.
+$L^*(x)$ is full-rate lighting with the same G-buffer, BRDF and light set. For a rate $r\in\{1,2,4\}$, each $r\times r$ block reuses the result at its top-left pixel $x_r$. The recorded tile error is the maximum absolute luminance residual.
 
-The benchmark records:
+```math
+L_r(x)=L^*(x_r),\qquad
+e_r(T)=\max_{x\in T}\left|Y\!\left(L_r(x)-L^*(x)\right)\right|.
+```
 
-- lighting-pass GPU time,
-- linear-HDR RMSE and relative RMSE against full-rate shading,
-- gradient RMSE,
-- maximum error,
-- fraction of pixels whose actual luminance error exceeds the requested budget,
-- fraction of pixels shaded at each selected rate.
+The lighting proxy evaluates representative albedo, roughness, normal and position deviations using one light. It predicts $\widehat e_4$ and uses $\widehat e_2=0.42\widehat e_4$. The feature-only gate compares the same four G-buffer extents with fixed scaled thresholds. The parallel version uses the same gate and distributes the maximum reduction across the workgroup. Mixed or incomplete tiles fall back to rate 1 in both gates.
 
-## Important scope
+## Build
 
-This project is deliberately a starting point, not a finished novelty claim. Multirate shading and error-controlled shading already have prior art. A paper must position the contribution narrowly around **post-raster deferred many-light rate selection from existing G-buffer data** and compare directly with the closest prior methods.
+Requirements are CMake 3.25+, a C++20 compiler, Ninja, Python 3 with Jinja2, and a desktop OpenGL 4.6 Core driver. The initial CMake configuration downloads the pinned gfx-research-base revision and its dependencies. A local checkout can be supplied with `-DGFX_RESEARCH_BASE_LOCAL_PATH=../gfx-research-base`.
+
+```powershell
+python -m pip install jinja2
+cmake -S . -B out/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build out/build --parallel
+ctest --test-dir out/build --output-on-failure
+```
+
+On Linux, run the same build commands and omit `.exe` when launching an executable.
+
+## Controls
+
+Launch `gfx-research-radiance-rate.exe`. Use **Rate** for method and error budget, **Scene** for the light count.
+
+**Tests** runs the smoke, quick or full publication benchmark. Each GUI run writes to a new subdirectory under `results/publication`.
+
+## Experiments
+
+```powershell
+.\out\build\gfx-research-radiance-rate.exe --publication-smoke --output=results/rate-smoke
+python tools/analyze_results.py results/rate-smoke
+.\out\build\gfx-research-radiance-rate.exe --publication-suite --output=results/rate-paper
+python tools/analyze_results.py results/rate-paper
+```
+
+The paper profile uses 720p and 1080p, 16, 64 and 256 lights, three camera poses and three error budgets. Both full-rate arms are timed in every block. The direct baseline bypasses the shared adaptive gate and its barriers. Lighting dispatch and its memory barrier are measured with the G-buffer frozen.
+
+| Output | Contents |
+|---|---|
+| `timings.csv` | Individual elapsed queries for each method and block |
+| `quality_cost.csv` | Matched HDR errors, time deltas and proxy error-budget failures on selected coarse tiles |
+| `fixed_quality.csv` | Fastest measured setting within fixed relative-RMSE limits for each workload |
+
+Analysis checks full-rate equivalence and the serial-versus-parallel gate equivalence before ranking operating points. The GGX proxy is an empirical error estimate. The study uses compute-shader sampling on regular tiles.
+
+## References
+
+1. Bruce Walter et al. [Microfacet Models for Refraction through Rough Surfaces](https://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf). Eurographics Symposium on Rendering, 2007.
+2. NVIDIA. [Variable Rate Shading](https://developer.nvidia.com/vrworks/graphics/variablerateshading). Hardware context for related shading-rate approaches.

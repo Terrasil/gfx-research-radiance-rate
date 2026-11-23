@@ -10,7 +10,7 @@ layout(rgba16f, binding = 0) uniform writeonly image2D uOutput;
 layout(r16f, binding = 1) uniform writeonly image2D uRateOutput;
 
 uniform vec3 uEye;
-uniform int uMode; // 0 full, 1 fixed 2x2, 2 fixed 4x4, 3 heuristic, 4 proposed radiance-error estimator
+uniform int uMode; // 0 full, 1 fixed 2x2, 2 fixed 4x4, 3 heuristic, 4 radiance proxy, 5 serial feature gate, 6 parallel feature gate, 7 direct full rate
 uniform int uLightCount;
 uniform float uErrorBudget;
 uniform uint uFrameSeed;
@@ -21,6 +21,7 @@ shared vec4 sA[64];
 shared vec4 sN[64];
 shared vec4 sP[64];
 shared vec4 sRadiance[64];
+shared vec4 sFeatures[64];
 shared int sRate;
 shared float sPredictedError;
 
@@ -116,6 +117,41 @@ float representativeErrorBound(
     return (eA + eN + eP + eR) * max(lightScale, 0.5);
 }
 
+int featureRate(vec4 maximum) {
+    float k = clamp(uErrorBudget / 0.025, 0.25, 2.0);
+    if (all(lessThan(maximum, vec4(0.05,0.05,0.008,0.12)*k))) return 4;
+    if (all(lessThan(maximum, vec4(0.12,0.12,0.025,0.32)*k))) return 2;
+    return 1;
+}
+
+void parallelFeatureRate(int idx, vec4 ar, vec4 nv, vec4 pv) {
+    if (idx == 0) {
+        sA[0] = ar;
+        sN[0] = nv;
+        sP[0] = pv;
+    }
+    barrier();
+    vec4 feature = vec4(1e10);
+    if (pv.a >= 0.5 && nv.a >= 0.5 && sP[0].a >= 0.5 && sN[0].a >= 0.5) {
+        feature = vec4(length(ar.rgb - sA[0].rgb), abs(ar.a - sA[0].a),
+                      1.0 - clamp(dot(decodeNormal(nv),decodeNormal(sN[0])),-1.0,1.0),
+                      length(pv.xyz - sP[0].xyz));
+    }
+    sFeatures[idx] = feature;
+    barrier();
+    if (idx < 8) {
+        vec4 maximum = sFeatures[idx*8];
+        for (int k=1; k<8; ++k) maximum = max(maximum,sFeatures[idx*8+k]);
+        sA[idx] = maximum;
+    }
+    barrier();
+    if (idx == 0) {
+        vec4 maximum = sA[0];
+        for (int k=1; k<8; ++k) maximum = max(maximum,sA[k]);
+        sRate = featureRate(maximum);
+    }
+}
+
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 local = ivec2(gl_LocalInvocationID.xy);
@@ -126,61 +162,75 @@ void main() {
     vec4 ar = inside ? texelFetch(uAlbedoRoughness, pixel, 0) : vec4(0.0);
     vec4 nv = inside ? texelFetch(uNormalValid, pixel, 0) : vec4(0.0);
     vec4 pv = inside ? texelFetch(uPositionValid, pixel, 0) : vec4(0.0);
-    sA[idx] = ar;
-    sN[idx] = nv;
-    sP[idx] = pv;
-    barrier();
+    if (uMode == 7) {
+        if (inside) {
+            imageStore(uOutput,pixel,vec4(shade(ar,nv,pv),-1.0));
+            imageStore(uRateOutput,pixel,vec4(1.0));
+        }
+        return;
+    }
 
-    if (idx == 0) {
-        sRate = 1;
-        sPredictedError = 0.0;
-        if (uMode == 1) {
-            sRate = 2;
-        } else if (uMode == 2) {
-            sRate = 4;
-        } else if (uMode != 0) {
-            int validCount = 0;
-            int firstValid = -1;
-            float maxAlbedo = 0.0;
-            float maxRough = 0.0;
-            float maxNormal = 0.0;
-            float maxPosition = 0.0;
-            int ia = 0, ir = 0, inorm = 0, ip = 0;
-            for (int i = 0; i < 64; ++i) {
-                if (sP[i].a < 0.5 || sN[i].a < 0.5) continue;
-                if (firstValid < 0) firstValid = i;
-                ++validCount;
-            }
-            if (validCount == 64 && firstValid >= 0) {
-                vec4 ca = sA[firstValid];
-                vec4 cn = sN[firstValid];
-                vec4 cp = sP[firstValid];
-                vec3 n0 = decodeNormal(cn);
+    if (uMode == 6) {
+        parallelFeatureRate(idx,ar,nv,pv);
+    } else {
+        sA[idx] = ar;
+        sN[idx] = nv;
+        sP[idx] = pv;
+        barrier();
+
+        if (idx == 0) {
+            sRate = 1;
+            sPredictedError = 0.0;
+            if (uMode == 1) {
+                sRate = 2;
+            } else if (uMode == 2) {
+                sRate = 4;
+            } else if (uMode != 0) {
+                int validCount = 0;
+                int firstValid = -1;
+                float maxAlbedo = 0.0;
+                float maxRough = 0.0;
+                float maxNormal = 0.0;
+                float maxPosition = 0.0;
+                int ia = 0, ir = 0, inorm = 0, ip = 0;
                 for (int i = 0; i < 64; ++i) {
-                    float da = length(sA[i].rgb - ca.rgb);
-                    float dr = abs(sA[i].a - ca.a);
-                    float dn = 1.0 - clamp(dot(decodeNormal(sN[i]), n0), -1.0, 1.0);
-                    float dp = length(sP[i].xyz - cp.xyz);
-                    if (da > maxAlbedo) { maxAlbedo = da; ia = i; }
-                    if (dr > maxRough) { maxRough = dr; ir = i; }
-                    if (dn > maxNormal) { maxNormal = dn; inorm = i; }
-                    if (dp > maxPosition) { maxPosition = dp; ip = i; }
+                    if (sP[i].a < 0.5 || sN[i].a < 0.5) continue;
+                    if (firstValid < 0) firstValid = i;
+                    ++validCount;
                 }
+                if (validCount == 64 && firstValid >= 0) {
+                    vec4 ca = sA[firstValid];
+                    vec4 cn = sN[firstValid];
+                    vec4 cp = sP[firstValid];
+                    vec3 n0 = decodeNormal(cn);
+                    for (int i = 0; i < 64; ++i) {
+                        float da = length(sA[i].rgb - ca.rgb);
+                        float dr = abs(sA[i].a - ca.a);
+                        float dn = 1.0 - clamp(dot(decodeNormal(sN[i]), n0), -1.0, 1.0);
+                        float dp = length(sP[i].xyz - cp.xyz);
+                        if (da > maxAlbedo) { maxAlbedo = da; ia = i; }
+                        if (dr > maxRough) { maxRough = dr; ir = i; }
+                        if (dn > maxNormal) { maxNormal = dn; inorm = i; }
+                        if (dp > maxPosition) { maxPosition = dp; ip = i; }
+                    }
 
-                if (uMode == 3) {
-                    // Conventional screen-space heuristic baseline.
-                    if (maxNormal < 0.015 && maxPosition < 0.22 && maxAlbedo < 0.08 && maxRough < 0.08) sRate = 4;
-                    else if (maxNormal < 0.05 && maxPosition < 0.55 && maxAlbedo < 0.18 && maxRough < 0.18) sRate = 2;
-                } else {
-                    vec4 extremeA = sA[ia];
-                    vec4 extremeN = sN[inorm];
-                    vec4 extremeP = sP[ip];
-                    float extremeR = sA[ir].a;
-                    sPredictedError = representativeErrorBound(ca, cn, cp, extremeA, extremeN, extremeP, extremeR);
-                    float e4 = sPredictedError;
-                    float e2 = sPredictedError * 0.42;
-                    if (e4 <= uErrorBudget) sRate = 4;
-                    else if (e2 <= uErrorBudget) sRate = 2;
+                    if (uMode == 3) {
+                        // Conventional screen-space heuristic baseline.
+                        if (maxNormal < 0.015 && maxPosition < 0.22 && maxAlbedo < 0.08 && maxRough < 0.08) sRate = 4;
+                        else if (maxNormal < 0.05 && maxPosition < 0.55 && maxAlbedo < 0.18 && maxRough < 0.18) sRate = 2;
+                    } else if (uMode == 5) {
+                        sRate = featureRate(vec4(maxAlbedo,maxRough,maxNormal,maxPosition));
+                    } else {
+                        vec4 extremeA = sA[ia];
+                        vec4 extremeN = sN[inorm];
+                        vec4 extremeP = sP[ip];
+                        float extremeR = sA[ir].a;
+                        sPredictedError = representativeErrorBound(ca, cn, cp, extremeA, extremeN, extremeP, extremeR);
+                        float e4 = sPredictedError;
+                        float e2 = sPredictedError * 0.42;
+                        if (e4 <= uErrorBudget) sRate = 4;
+                        else if (e2 <= uErrorBudget) sRate = 2;
+                    }
                 }
             }
         }
@@ -199,6 +249,9 @@ void main() {
     int sy = (local.y / rate) * rate;
     int sampleIndex = sy * 8 + sx;
     vec4 color = sRadiance[sampleIndex];
+    // Alpha is an unused diagnostic channel; RGB and the display transform
+    // remain identical. -1 denotes non-predictor methods.
+    color.a = uMode == 4 && rate > 1 ? sPredictedError * (rate == 2 ? 0.42 : 1.0) : -1.0;
     imageStore(uOutput, pixel, color);
     imageStore(uRateOutput, pixel, vec4(float(rate), 0.0, 0.0, 1.0));
 }

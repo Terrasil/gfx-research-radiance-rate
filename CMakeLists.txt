@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(GFX_RESEARCH_BASE_GIT_TAG main CACHE STRING "gfx-research-base Git revision")
+set(GFX_RESEARCH_BASE_GIT_TAG a419073ff7c5fd781ef52a4ff9fcdb0c67c5275c CACHE STRING "gfx-research-base Git revision")
 set(GFX_RESEARCH_BASE_LOCAL_PATH "" CACHE PATH "Optional local gfx-research-base checkout")
 
 if(GFX_RESEARCH_BASE_LOCAL_PATH)
