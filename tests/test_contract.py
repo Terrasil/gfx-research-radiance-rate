@@ -13,6 +13,10 @@ for token in [
     "violationRate",
     "--publication-quick",
     "--publication-suite",
+    "savePreviewPng(",
+    "saveRgbPfm(",
+    "captureIndex_.open(",
+    "captureFullProfile_",
 ]:
     assert token in cpp, token
 

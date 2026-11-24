@@ -57,6 +57,38 @@ The paper profile uses 720p and 1080p, 16, 64 and 256 lights, three camera poses
 
 Analysis checks full-rate equivalence and the serial-versus-parallel gate equivalence before ranking operating points. The GGX proxy is an empirical error estimate. The study uses compute-shader sampling on regular tiles.
 
+
+## Automatic publication captures
+
+All **smoke**, **quick**, and **full** profiles now write `captures/index.csv` and
+matched PNGs: `radiance-budget`, `parallel-feature`, `full-rate-direct`, and
+full-rate references. The full profile selects a manageable 1080p, 256-light,
+`B=0.025`, roughness-1 sample from **each of the three camera presets**.
+Quick and smoke profiles capture their own smaller configurations, so `captures`
+is never absent after a completed test. The reference and methods share the same
+Reinhard + gamma 2.2 presentation mapping with exposure 0.2. Do **not** compute
+error metrics from these 8-bit PNGs.
+
+For camera 2, each selected adaptive method also writes full-precision linear-HDR
+PFM data. The full suite preserves the previous `stress-{method,reference}.pfm`
+and `parallel-feature-{method,reference}.pfm` file names for compatibility. `parallel-feature-tiles.csv` contains post-hoc 8x8 shading-rate and
+error statistics; it is not an a priori prediction or GPU stage-timing split.
+All new writes happen after the timed GPU dispatch and so do not enter elapsed
+GPU query results. Any capture write failure stops the suite instead of being
+silently ignored. The original CSV columns and method IDs remain unchanged.
+
+```powershell
+.\out\build\gfx-research-radiance-rate.exe --publication-quick --output=results/rate-quick
+.\out\build\gfx-research-radiance-rate.exe --publication-suite --output=results/rate-paper
+python tools/analyze_results.py results/rate-paper
+python tools/check_captures.py results/rate-paper
+python tools/analyze_tile_diagnostics.py results/rate-paper/captures/parallel-feature-tiles.csv --budget 0.025
+```
+
+Note: the previous `paper` dataset was recorded before these capture changes.
+No additional GPU results or visual superiority are asserted until the new
+profile has actually been executed.
+
 ## References
 
 1. Bruce Walter et al. [Microfacet Models for Refraction through Rough Surfaces](https://www.cs.cornell.edu/~srm/publications/EGSR07-btdf.pdf). Eurographics Symposium on Rendering, 2007.

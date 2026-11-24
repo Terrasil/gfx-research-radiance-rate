@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
+#include <cstddef>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -195,17 +197,140 @@ Metrics calculateMetrics(
     return out;
 }
 
-bool savePfm(const std::filesystem::path& path, unsigned int texture, int width, int height) {
-    const auto rgba = readRgba(texture, width, height);
+// Minimal dependency-free PNG writer for reproducible preview captures.
+// Converts linear RGB to an explicitly documented common display mapping.
+// The HDR PFM remains the source for all numerical image-error measurements.
+std::uint32_t pngCrc32(const unsigned char* bytes, std::size_t count) {
+    std::uint32_t crc = 0xffffffffu;
+    for (std::size_t i = 0; i < count; ++i) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1u) ^ ((crc & 1u) ? 0xedb88320u : 0u);
+    }
+    return crc ^ 0xffffffffu;
+}
+void pngBe32(std::vector<unsigned char>& dest, std::uint32_t value) {
+    dest.push_back(static_cast<unsigned char>(value >> 24));
+    dest.push_back(static_cast<unsigned char>(value >> 16));
+    dest.push_back(static_cast<unsigned char>(value >> 8));
+    dest.push_back(static_cast<unsigned char>(value));
+}
+void pngChunk(std::ofstream& output, const char tag[4], const std::vector<unsigned char>& data) {
+    std::vector<unsigned char> chunk;
+    chunk.reserve(4 + data.size());
+    chunk.insert(chunk.end(), tag, tag + 4);
+    chunk.insert(chunk.end(), data.begin(), data.end());
+    std::vector<unsigned char> length;
+    pngBe32(length, static_cast<std::uint32_t>(data.size()));
+    output.write(reinterpret_cast<const char*>(length.data()), static_cast<std::streamsize>(length.size()));
+    output.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+    std::vector<unsigned char> crc;
+    pngBe32(crc, pngCrc32(chunk.data(), chunk.size()));
+    output.write(reinterpret_cast<const char*>(crc.data()), static_cast<std::streamsize>(crc.size()));
+}
+bool savePreviewPng(const std::filesystem::path& path, const std::vector<float>& rgba,
+                    int width, int height) {
+    if (width <= 0 || height <= 0 || rgba.size() != static_cast<std::size_t>(width) * height * 4)
+        return false;
+    std::filesystem::create_directories(path.parent_path());
+    std::vector<unsigned char> raw;
+    raw.reserve(static_cast<std::size_t>(width * 3 + 1) * height);
+    for (int y = height - 1; y >= 0; --y) { // OpenGL readback is bottom-up.
+        raw.push_back(0); // PNG filter 0.
+        for (int x = 0; x < width; ++x) {
+            const auto index = (static_cast<std::size_t>(y) * width + x) * 4;
+            for (int channel = 0; channel < 3; ++channel) {
+                const float linear = std::max(0.0f, std::isfinite(rgba[index + channel]) ? rgba[index + channel] : 0.0f);
+                const float exposed = 0.2f * linear;
+                const float mapped = exposed / (1.0f + exposed); // Reinhard, gamma 1/2.2.
+                const float display = std::pow(mapped, 1.0f / 2.2f);
+                raw.push_back(static_cast<unsigned char>(std::clamp(std::lround(display * 255.0f), 0l, 255l)));
+            }
+        }
+    }
+    // Zlib stream with stored DEFLATE blocks; no additional library dependency.
+    std::vector<unsigned char> deflate{0x78, 0x01};
+    std::size_t offset = 0;
+    while (offset < raw.size()) {
+        const auto count = static_cast<std::uint16_t>(std::min<std::size_t>(65535, raw.size() - offset));
+        deflate.push_back(offset + count == raw.size() ? 1 : 0);
+        deflate.push_back(static_cast<unsigned char>(count));
+        deflate.push_back(static_cast<unsigned char>(count >> 8));
+        const auto inverse = static_cast<std::uint16_t>(~count);
+        deflate.push_back(static_cast<unsigned char>(inverse));
+        deflate.push_back(static_cast<unsigned char>(inverse >> 8));
+        deflate.insert(deflate.end(), raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                       raw.begin() + static_cast<std::ptrdiff_t>(offset + count));
+        offset += count;
+    }
+    std::uint32_t a = 1, b = 0;
+    for (const auto value : raw) { a = (a + value) % 65521u; b = (b + a) % 65521u; }
+    pngBe32(deflate, (b << 16u) | a);
+    std::ofstream output(path, std::ios::binary);
+    if (!output) return false;
+    constexpr unsigned char signature[]{137,80,78,71,13,10,26,10};
+    output.write(reinterpret_cast<const char*>(signature), sizeof(signature));
+    std::vector<unsigned char> ihdr;
+    pngBe32(ihdr, static_cast<std::uint32_t>(width));
+    pngBe32(ihdr, static_cast<std::uint32_t>(height));
+    ihdr.insert(ihdr.end(), {8,2,0,0,0}); // RGB, 8-bit.
+    pngChunk(output, "IHDR", ihdr);
+    pngChunk(output, "IDAT", deflate);
+    pngChunk(output, "IEND", {});
+    return output.good();
+}
+
+bool saveRgbPfm(const std::filesystem::path& path, const std::vector<float>& rgba,
+                int width, int height) {
+    if (width <= 0 || height <= 0 || rgba.size() != static_cast<std::size_t>(width) * height * 4) return false;
     std::filesystem::create_directories(path.parent_path());
     std::ofstream out(path, std::ios::binary);
     if (!out) return false;
     out << "PF\n" << width << ' ' << height << "\n-1.0\n";
-    for (int y = 0; y < height; ++y) {
+    for (int y = 0; y < height; ++y)
         for (int x = 0; x < width; ++x) {
-            const std::size_t k = (static_cast<std::size_t>(y) * width + x) * 4;
-            out.write(reinterpret_cast<const char*>(&rgba[k]), sizeof(float) * 3);
+            const auto index = (static_cast<std::size_t>(y) * width + x) * 4;
+            out.write(reinterpret_cast<const char*>(&rgba[index]), sizeof(float) * 3);
         }
+    return out.good();
+}
+
+// For the publication stress case, retain a per-tile diagnostic for an actual
+// captured feature-gated frame. This is post-hoc error measurement, not a
+// certified a priori bound or a timing-stage breakdown.
+bool saveTileDiagnostics(const std::filesystem::path& path,
+                         const std::vector<float>& candidate,
+                         const std::vector<float>& reference,
+                         const std::vector<float>& rates,
+                         int width, int height, float budget) {
+    if (candidate.size() != reference.size() ||
+        rates.size() != static_cast<std::size_t>(width) * height) return false;
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path);
+    if (!out) return false;
+    out << "tile_x,tile_y,rate,valid_pixels,pixel_budget_violations,max_abs_luminance_error,mean_abs_luminance_error,rgb_squared_error,rgb_squared_reference\n";
+    out << std::setprecision(12);
+    for (int ty=0;ty<height;ty+=8) for(int tx=0;tx<width;tx+=8) {
+        const std::size_t first=static_cast<std::size_t>(ty)*width+tx;
+        const float rate=rates[first];
+        int pixels=0, violations=0;
+        double maximum=0.0,sumAbs=0.0,rgbSq=0.0,refSq=0.0;
+        for(int y=ty;y<std::min(ty+8,height);++y)
+            for(int x=tx;x<std::min(tx+8,width);++x) {
+                const std::size_t k=(static_cast<std::size_t>(y)*width+x)*4;
+                const double diff=std::abs(luminance(candidate,k)-luminance(reference,k));
+                maximum=std::max(maximum,diff);
+                sumAbs+=diff;
+                violations+=diff>budget;
+                for(int c=0;c<3;++c) {
+                    const double d=double(candidate[k+c])-reference[k+c];
+                    rgbSq+=d*d;
+                    refSq+=double(reference[k+c])*reference[k+c];
+                }
+                ++pixels;
+            }
+        out << tx/8 << ',' << ty/8 << ',' << rate << ',' << pixels << ','
+            << violations << ',' << maximum << ',' << sumAbs/std::max(pixels,1)
+            << ',' << rgbSq << ',' << refSq << '\n';
     }
     return out.good();
 }
@@ -381,6 +506,7 @@ private:
                 launch("Run smoke test", false, true);
                 launch("Run quick suite", false);
                 launch("Run full suite", true);
+                ImGui::TextWrapped("PNG captures are saved automatically for all profiles (three methods and matched references). Full suite saves 1080p / 256-light views of all three cameras; camera 2 also includes HDR PFM data.");
                 if (!benchmarkMessage_.empty()) ImGui::TextWrapped("%s", benchmarkMessage_.c_str());
                 if (!benchmarkOutput_.empty()) ImGui::TextWrapped("Output: %s", benchmarkOutput_.string().c_str());
                 ImGui::EndTabItem();
@@ -496,6 +622,7 @@ private:
     bool runsBenchmarkFromCli() const { return options_.smoke || options_.quick || options_.full; }
 
     void startBenchmark(bool full, bool smoke) {
+        captureFullProfile_ = full;
         cases_.clear();
         const std::array methods = {Method::FullRate, Method::Fixed2x2, Method::Fixed4x4, Method::Heuristic,
                                    Method::RadianceBudget, Method::FeatureBudget, Method::ParallelFeature, Method::DirectFullRate};
@@ -543,6 +670,10 @@ private:
         csv_.open(benchmarkOutput_ / "raw.csv");
         rawTiming_.open(benchmarkOutput_ / "timings.csv");
         manifest_.open(benchmarkOutput_ / "manifest.txt");
+        std::filesystem::create_directories(benchmarkOutput_ / "captures");
+        captureIndex_.open(benchmarkOutput_ / "captures" / "index.csv");
+        if (!captureIndex_) throw std::runtime_error("Could not open captures/index.csv");
+        captureIndex_ << "file,method,camera,width,height,lights,roughness_scale,error_budget,format,exposure,display_mapping\n";
         if (!csv_ || !rawTiming_ || !manifest_) throw std::runtime_error("Could not open benchmark outputs");
         manifest_ << "profile=" << profile
                   << "\nplanned=" << cases_.size() << "\nwarmup=" << warmupFrames_ << "\nsamples=" << sampleFrames_
@@ -564,6 +695,7 @@ private:
         benchmarkRunning_ = false;
         if (csv_.is_open()) csv_.close();
         if (rawTiming_.is_open()) rawTiming_.close();
+        if (captureIndex_.is_open()) captureIndex_.close();
         if (manifest_.is_open()) {
             manifest_ << "completed=" << (completed ? 1 : 0) << '\n';
             manifest_.close();
@@ -605,10 +737,62 @@ private:
             const auto rates = readR(result_.color(1), c.width, c.height);
             metrics_ = calculateMetrics(image, referenceImage_, rates, c.width, c.height, c.budget);
             metricsCaptured_ = true;
-            if (c.method == Method::RadianceBudget && c.lights == 256 && c.cameraPreset == 2
-                && c.block == 0 && c.roughnessScale == 1.0f && c.budget == 0.025f) {
-                savePfm(benchmarkOutput_ / "captures" / "stress-method.pfm", result_.color(0), c.width, c.height);
-                savePfm(benchmarkOutput_ / "captures" / "stress-reference.pfm", reference_.color(0), c.width, c.height);
+            const bool baselineCapture = c.block == 0 && std::abs(c.budget - 0.025f) < 1e-5f
+                && (c.method == Method::RadianceBudget || c.method == Method::ParallelFeature
+                    || c.method == Method::DirectFullRate);
+            // Quick/smoke always produce captures; full suite keeps a small matched
+            // 1080p / 256-light sample for each of the three camera presets.
+            const bool sampleScene = captureFullProfile_ ? (c.height == 1080 && c.lights == 256
+                                                   && std::abs(c.roughnessScale - 1.0f) < 1e-5f)
+                                    : true;
+            if (baselineCapture && sampleScene) {
+                const std::string prefix = "camera" + std::to_string(c.cameraPreset) + "-"
+                    + std::to_string(c.width) + "x" + std::to_string(c.height) + "-"
+                    + std::to_string(c.lights) + "lights";
+                const std::string name = prefix + "-" + methodId(c.method) + ".png";
+                if (!savePreviewPng(benchmarkOutput_ / "captures" / name, image, c.width, c.height))
+                    throw std::runtime_error("Cannot write capture PNG: " + name);
+                captureIndex_ << name << ',' << methodId(c.method) << ',' << c.cameraPreset << ','
+                              << c.width << ',' << c.height << ',' << c.lights << ','
+                              << c.roughnessScale << ',' << c.budget << ",png,0.2,Reinhard-gamma2.2\n";
+                const std::string refName = prefix + "-full-rate-reference.png";
+                if (!std::filesystem::exists(benchmarkOutput_ / "captures" / refName)) {
+                    if (!savePreviewPng(benchmarkOutput_ / "captures" / refName,
+                                        referenceImage_, c.width, c.height))
+                        throw std::runtime_error("Cannot write full-rate reference PNG: " + refName);
+                    captureIndex_ << refName << ",full-rate-reference," << c.cameraPreset << ','
+                                  << c.width << ',' << c.height << ',' << c.lights << ','
+                                  << c.roughnessScale << ',' << c.budget << ",png,0.2,Reinhard-gamma2.2\n";
+                }
+                // Keep the exact HDR data required to reproduce published errors.
+                // Save it once per method for the designated stress case.
+                if (c.method != Method::DirectFullRate && c.cameraPreset == 2) {
+                    const bool legacyStressNames = captureFullProfile_ && c.height == 1080;
+                    const std::string methodPfm = legacyStressNames
+                        ? (c.method == Method::RadianceBudget ? "stress-method.pfm" : "parallel-feature-method.pfm")
+                        : prefix + "-" + methodId(c.method) + ".pfm";
+                    const std::string referencePfm = legacyStressNames
+                        ? (c.method == Method::RadianceBudget ? "stress-reference.pfm" : "parallel-feature-reference.pfm")
+                        : prefix + "-full-rate-reference.pfm";
+                    if (!saveRgbPfm(benchmarkOutput_ / "captures" / methodPfm, image,c.width,c.height))
+                        throw std::runtime_error("Cannot write method HDR PFM capture");
+                    if (!std::filesystem::exists(benchmarkOutput_ / "captures" / referencePfm)) {
+                        if (!saveRgbPfm(benchmarkOutput_ / "captures" / referencePfm,referenceImage_,c.width,c.height))
+                            throw std::runtime_error("Cannot write reference HDR PFM capture");
+                        captureIndex_ << referencePfm << ",full-rate-reference," << c.cameraPreset << ','
+                                      << c.width << ',' << c.height << ',' << c.lights << ','
+                                      << c.roughnessScale << ',' << c.budget << ",pfm,linear-HDR,unmodified\n";
+                    }
+                    captureIndex_ << methodPfm << ',' << methodId(c.method) << ',' << c.cameraPreset << ','
+                                  << c.width << ',' << c.height << ',' << c.lights << ','
+                                  << c.roughnessScale << ',' << c.budget << ",pfm,linear-HDR,unmodified\n";
+                    if (c.method == Method::ParallelFeature) {
+                        if (!saveTileDiagnostics(benchmarkOutput_ / "captures" / "parallel-feature-tiles.csv",
+                                                 image, referenceImage_, rates, c.width, c.height, c.budget))
+                            throw std::runtime_error("Failed to write feature-gate tile diagnostics");
+                    }
+                }
+                captureIndex_.flush();
             }
         }
 
@@ -660,6 +844,7 @@ private:
     };
     std::optional<LiveSettings> liveSettings_;
     bool benchmarkRunning_ = false;
+    bool captureFullProfile_ = false;
     std::filesystem::path benchmarkOutput_;
     std::string benchmarkMessage_;
     std::vector<Case> cases_;
@@ -671,7 +856,7 @@ private:
     std::vector<float> referenceImage_;
     Metrics metrics_{};
     bool metricsCaptured_ = false;
-    std::ofstream csv_, rawTiming_, manifest_;
+    std::ofstream csv_, rawTiming_, manifest_, captureIndex_;
 };
 
 LaunchOptions parseOptions(int argc, char** argv) {
